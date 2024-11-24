@@ -183,6 +183,9 @@ int main(int argc, char *argv[]) {
         if (pthread_create(&task_thread, NULL, calculate_and_respond, client_socket_ptr) != 0) {
             perror("Failed to create task thread");
             close(client_socket);
+            free(client_socket_ptr);
+        } else {
+            pthread_detach(task_thread);
         }
     }
 
