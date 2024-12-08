@@ -9,6 +9,35 @@ import requests
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse
 
+
+def cas_get(data, key, lock):
+    with lock:
+        return data.get(key, None)
+
+
+def cas_set(data, key, value, lock):
+    with lock:
+        current_value = data.get(key, None)
+        if current_value:
+            return False
+        data[key] = value
+        return True
+
+
+def cas_update(data, key, expected_value, new_value, lock):
+    with lock:
+        current_value = data.get(key, None)
+        if current_value and current_value == expected_value:
+            data[key] = new_value
+            return True
+        return False
+
+
+def cas_pop(data, key, lock):
+    with lock:
+        return data.pop(key, None)
+
+
 # Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
@@ -22,10 +51,9 @@ app = FastAPI()
 
 host_name = "http://127.0.0.1:"
 
-# Глобальное состояние узла
 state = {
     "role": "replica",  # Роль узла: replica или master
-    "data": {},  # Локальное хранилище данных
+    "data": dict(),  # Локальное хранилище данных
     "wal": [],  # Write-Ahead Log
     "peers": [
         [f"{host_name}{port}", 1] for port in range(5030, 5033)
@@ -38,6 +66,7 @@ state = {
     "election_timeout": random.uniform(2, 5),
     "port": None,  # Порт текущего узла
 }
+db_lock = threading.Lock()
 
 
 # ====================== CRUD ============================
@@ -51,10 +80,17 @@ async def get_item(key: str):
             replica = random.choice(alive_peers)
             return Response(content=f"{replica[0]}/data/{key}", status_code=302)
         else:
-            return JSONResponse(content=state["data"].get(key, None), status_code=200)
+            value = cas_get(state["data"], key, db_lock)
+            entry = {"operation": "post", "key": key, "value": value}
+            state["wal"].append(entry)
+            return JSONResponse(
+                content=cas_get(state["data"], key, db_lock), status_code=200
+            )
     else:
         logger.info(f"{state['port']}: key - {key}")
-        return JSONResponse(content=state["data"].get(key, None), status_code=200)
+        return JSONResponse(
+            content=cas_get(state["data"], key, db_lock), status_code=200
+        )
 
 
 @app.post("/data/")
@@ -77,7 +113,12 @@ async def create_item(key: str, value: str):
 async def update_item(key: str, value: str):
     if state["role"] == "master":
         success = append_log_and_replicate_with_majority(
-            {"operation": "put", "key": key, "value": value}
+            {
+                "operation": "put",
+                "key": key,
+                "old_value": cas_get(state["data"], key, db_lock),
+                "value": value,
+            }
         )
         if success:
             return JSONResponse(content={"status": "success"}, status_code=200)
@@ -93,7 +134,12 @@ async def update_item(key: str, value: str):
 async def partial_update_item(key: str, value: str):
     if state["role"] == "master":
         success = append_log_and_replicate_with_majority(
-            {"operation": "patch", "key": key, "value": value}
+            {
+                "operation": "patch",
+                "key": key,
+                "old_value": cas_get(state["data"], key, db_lock),
+                "value": value,
+            }
         )
         if success:
             return JSONResponse(content={"status": "success"}, status_code=200)
@@ -123,10 +169,19 @@ async def delete_item(key: str):
 
 
 def append_log_and_replicate_with_majority(entry):
+    check_key_status = True
     state["wal"].append(entry)
-    state["data"][entry["key"]] = (
-        entry.get("value") if entry["operation"] != "delete" else None
-    )
+    if entry["operation"] != "delete":
+        if entry["operation"] != "post":
+            check_key_status = cas_update(
+                state["data"], entry["key"], entry["old_value"], entry["value"], db_lock
+            )
+        else:
+            check_key_status = cas_set(
+                state["data"], entry["key"], entry.get("value"), db_lock
+            )
+    else:
+        cas_pop(state["data"], entry["key"], db_lock)
 
     confirmations = 1
     total_peers = len(state["peers"])
@@ -146,16 +201,18 @@ def append_log_and_replicate_with_majority(entry):
         except requests.exceptions.RequestException:
             pass
 
-    threads = []
-    for peer in state["peers"]:
-        thread = threading.Thread(target=replicate_to_peer, args=(peer[0],))
-        thread.start()
-        threads.append(thread)
+    if check_key_status:
+        threads = []
+        for peer in state["peers"]:
+            thread = threading.Thread(target=replicate_to_peer, args=(peer[0],))
+            thread.start()
+            threads.append(thread)
 
-    for thread in threads:
-        thread.join()
+        for thread in threads:
+            thread.join()
 
-    return confirmations >= majority
+        return confirmations >= majority
+    return check_key_status
 
 
 @app.post("/replicate")
@@ -177,9 +234,14 @@ async def handle_replication(entry: dict, request: Request):
 
     state["wal"].append(entry)
     if entry["operation"] != "delete":
-        state["data"][entry["key"]] = entry["value"]
+        if entry["operation"] != "post":
+            cas_update(
+                state["data"], entry["key"], entry["old_value"], entry["value"], db_lock
+            )
+        else:
+            cas_set(state["data"], entry["key"], entry["value"], db_lock)
     else:
-        state["data"].pop(entry["key"], None)
+        cas_pop(state["data"], entry["key"], db_lock)
 
     return JSONResponse(content={"status": "ok"}, status_code=200)
 
@@ -197,7 +259,6 @@ async def handle_election(request: Request):
     logger.info(f"{state['port']}: has sent a vote for {candidate_id}")
 
     if term > state["term"]:
-        # logger.info(f"{state['port']} received a vote-request from {candidate_id}, voting!")
         state["term"] = term
         state["role"] = "replica"
         state["votes"] = 0
@@ -217,7 +278,6 @@ def start_election():
 
     def request_vote(node_link):
         nonlocal answers_amount
-        # logger.info(f"{state['port']}: came to send request_vote {node_link}, {f"http://{node_link}/election"}")
         try:
             response = requests.post(
                 f"{node_link}/election",
@@ -278,6 +338,7 @@ async def handle_heartbeat(request: Request):
     term = body.get("term")
     master_id = body.get("master_id")
     master_data = body.get("data", {})
+    wal_data = body.get("wal_data", {})
 
     if term >= state["term"]:
         state["term"] = term
@@ -285,6 +346,7 @@ async def handle_heartbeat(request: Request):
         state["role"] = "replica"
         state["last_heartbeat"] = time.time()
         state["data"] = master_data
+        state["wal"] = wal_data
         return JSONResponse(content={"status": "ok"}, status_code=200)
 
     return JSONResponse(content={"status": "rejected"}, status_code=400)
@@ -300,6 +362,7 @@ def send_heartbeat():
                         "term": state["term"],
                         "master_id": state["node_id"],
                         "data": state["data"],
+                        "wal_data": state["wal"],
                     },
                     timeout=1,
                 )
