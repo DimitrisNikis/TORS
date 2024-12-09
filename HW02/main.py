@@ -52,7 +52,7 @@ app = FastAPI()
 host_name = "http://127.0.0.1:"
 
 state = {
-    "role": "replica",  # Роль узла: replica или master
+    "role": "replica",  # Роль узла: replica, master или candidate
     "data": dict(),  # Локальное хранилище данных
     "wal": [],  # Write-Ahead Log
     "peers": [
@@ -96,9 +96,13 @@ async def get_item(key: str):
 @app.post("/data/")
 async def create_item(key: str, value: str):
     if state["role"] == "master":
-        success = append_log_and_replicate_with_majority(
+        success = replicate_with_majority(
             {"operation": "post", "key": key, "value": value}
         )
+        if success == "exists":
+            raise HTTPException(
+                status_code=400, detail=f"Key '{key}' already exists, post"
+            )
         if success:
             return JSONResponse(content={"status": "success"}, status_code=200)
         else:
@@ -112,7 +116,7 @@ async def create_item(key: str, value: str):
 @app.put("/data/{key}")
 async def update_item(key: str, value: str):
     if state["role"] == "master":
-        success = append_log_and_replicate_with_majority(
+        success = replicate_with_majority(
             {
                 "operation": "put",
                 "key": key,
@@ -120,6 +124,11 @@ async def update_item(key: str, value: str):
                 "value": value,
             }
         )
+        if success == "not_found":
+            raise HTTPException(
+                status_code=404, detail=f"Key '{key}' does not exist, put"
+            )
+
         if success:
             return JSONResponse(content={"status": "success"}, status_code=200)
         else:
@@ -133,7 +142,7 @@ async def update_item(key: str, value: str):
 @app.patch("/data/{key}")
 async def partial_update_item(key: str, value: str):
     if state["role"] == "master":
-        success = append_log_and_replicate_with_majority(
+        success = replicate_with_majority(
             {
                 "operation": "patch",
                 "key": key,
@@ -141,6 +150,10 @@ async def partial_update_item(key: str, value: str):
                 "value": value,
             }
         )
+        if success == "not_found":
+            raise HTTPException(
+                status_code=404, detail=f"Key '{key}' does not exist, put"
+            )
         if success:
             return JSONResponse(content={"status": "success"}, status_code=200)
         else:
@@ -154,9 +167,7 @@ async def partial_update_item(key: str, value: str):
 @app.delete("/data/{key}")
 async def delete_item(key: str):
     if state["role"] == "master":
-        success = append_log_and_replicate_with_majority(
-            {"operation": "delete", "key": key}
-        )
+        success = replicate_with_majority({"operation": "delete", "key": key})
         if success:
             return JSONResponse(content={"status": "success"}, status_code=200)
         else:
@@ -168,7 +179,7 @@ async def delete_item(key: str):
         )
 
 
-def append_log_and_replicate_with_majority(entry):
+def replicate_with_majority(entry):
     check_key_status = True
     state["wal"].append(entry)
     if entry["operation"] != "delete":
@@ -176,10 +187,14 @@ def append_log_and_replicate_with_majority(entry):
             check_key_status = cas_update(
                 state["data"], entry["key"], entry["old_value"], entry["value"], db_lock
             )
+            if not check_key_status:
+                return "not_found"
         else:
             check_key_status = cas_set(
                 state["data"], entry["key"], entry.get("value"), db_lock
             )
+            if not check_key_status:
+                return "exists"
     else:
         cas_pop(state["data"], entry["key"], db_lock)
 
